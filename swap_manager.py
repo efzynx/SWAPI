@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-# swap_manager.py — v1.2
-# Fitur:
-# 1) Cek swap (swapon -> fallback free -h) + detail /proc/swaps
-# 2) Buat swapfile
-# 3) Hapus swapfile
-# 4) Ubah prioritas swap (runtime + persist fstab bila applicable)
-# 5) Resize swapfile (pertahankan prioritas lama)
-# 6) Setup hybrid otomatis (zram + swapfile) dengan prioritas
-
 import os
 import shutil
 import subprocess
@@ -96,6 +86,38 @@ def get_priority_for(path: str):
         pass
     return None
 
+# ---------- Helpers untuk deteksi swap yang ada ----------
+def classify_existing_swaps():
+    """Kembalikan dict: {'zram': [paths], 'files': [paths], 'parts': [paths]} dari /proc/swaps"""
+    zram, files, parts = [], [], []
+    for s in get_swaps_from_proc():
+        name = s['name']
+        typ = s['type'].lower()
+        if 'zram' in name:
+            zram.append(name)
+        elif typ == 'file':
+            files.append(name)
+        else:
+            parts.append(name)
+    return {'zram': zram, 'files': files, 'parts': parts}
+
+def pick_from_list(title, items):
+    """Pilih satu item dari list, return path terpilih atau None kalau batal."""
+    if not items:
+        return None
+    print(f"\n{title}")
+    for i, v in enumerate(items, 1):
+        print(f"{i}. {v}")
+    print("0. Batal")
+    sel = input("Pilih: ").strip()
+    if sel == "0":
+        return None
+    if sel.isdigit() and 1 <= int(sel) <= len(items):
+        return items[int(sel) - 1]
+    print("❌ Pilihan tidak valid.")
+    return None
+
+
 # -------------------- Actions --------------------
 def check_swap():
     swapon = find_cmd("swapon")
@@ -163,7 +185,7 @@ def remove_swap():
     else:
         run(f"{SUDO} swapoff {path}")  # best effort
 
-    run(f"{SUDO} sed -i '\#{path}#d' /etc/fstab")
+    run(f"{SUDO} sed -i '#{path}#d' /etc/fstab")
     run(f"{SUDO} rm -f {path}")
     print("✅ Swapfile dihapus & fstab dibersihkan.")
 
@@ -209,12 +231,12 @@ def set_swap_priority():
     if "/zram" in target:
         print("ℹ ZRAM tidak dikonfigurasi via /etc/fstab. Untuk persist, atur di zram-generator (override.conf).")
     else:
-        run(f"{SUDO} sed -i '\#{re.escape(target)}#d' /etc/fstab")
+        run(f"{SUDO} sed -i '#{re.escape(target)}#d' /etc/fstab")
         run(f"echo '{target} none swap defaults,pri={new_pri} 0 0' | {SUDO} tee -a /etc/fstab > /dev/null")
         print("✅ /etc/fstab diperbarui.")
 
 
-# -------------------- NEW: Resize swapfile --------------------
+# -------------------- Resize swapfile --------------------
 def resize_swapfile():
     path = (input("Path swapfile yang ingin di-resize (default: /swapfile): ").strip() or "/swapfile")
     if not os.path.exists(path):
@@ -263,86 +285,267 @@ def resize_swapfile():
         print("⚠ 'swapon' tidak ditemukan. Swap akan aktif setelah reboot.")
 
     # Update fstab: hapus baris lama & tulis ulang dengan pri lama jika ada
-    run(f"{SUDO} sed -i '\#{re.escape(path)}#d' /etc/fstab")
+    run(f"{SUDO} sed -i '#{re.escape(path)}#d' /etc/fstab")
     opts = "defaults" + (f",pri={old_pri}" if old_pri is not None else "")
     run(f"echo '{path} none swap {opts} 0 0' | {SUDO} tee -a /etc/fstab > /dev/null")
     print("✅ /etc/fstab diperbarui.")
+    
+
+def resize_zram(dev="/dev/zram0", new_size_str=None):
+    """Resize zram device (default /dev/zram0) sambil pertahankan prioritas."""
+    if new_size_str is None:
+        new_size_str = input(f"Ukuran ZRAM baru untuk {dev} (mis. 4G): ").strip()
+    bytes_ = parse_size_to_bytes(new_size_str)
+    if not bytes_:
+        print("❌ Ukuran tidak valid.")
+        return
+
+    old_pri = get_priority_for(dev)
+
+    # Matikan swap ZRAM
+    swapoff = find_cmd("swapoff")
+    if swapoff:
+        run(f"{SUDO} {swapoff} {dev}")
+    else:
+        run(f"{SUDO} swapoff {dev}")
+
+    # Resize via zramctl kalau ada; kalau tidak, via sysfs
+    zramctl = find_cmd("zramctl")
+    if zramctl:
+        # reset dulu kalau perlu
+        run(f"{SUDO} {zramctl} -r {dev}")
+        # allocate ulang dengan size baru
+        code, out, err = run(f"{SUDO} {zramctl} --find --size {bytes_}")
+        if code != 0:
+            print("❌ Gagal set size zram via zramctl:", err)
+            return
+        # Cari device yang dipakai (stdout biasanya mengembalikan dev baru, fallback ke dev lama)
+        new_dev = out.strip().splitlines()[-1] if out.strip() else dev
+        dev = new_dev
+    else:
+        # sysfs fallback
+        if not os.path.exists(f"/sys/block/{os.path.basename(dev)}/disksize"):
+            print("❌ Tidak menemukan sysfs zram. Kernel mungkin tidak mendukung.")
+            return
+        run(f"echo {bytes_} | {SUDO} tee /sys/block/{os.path.basename(dev)}/disksize > /dev/null")
+
+    # format & aktifkan lagi
+    run(f"{SUDO} mkswap {dev}")
+    swapon = find_cmd("swapon")
+    if swapon:
+        if old_pri is not None:
+            code, _, err = run(f"{SUDO} {swapon} --priority {old_pri} {dev}")
+            if code != 0:
+                run(f"{SUDO} {swapon} -p {old_pri} {dev}")
+        else:
+            run(f"{SUDO} {swapon} {dev}")
+        print("✅ ZRAM di-resize & aktif kembali.")
+    else:
+        print("⚠ 'swapon' tidak ditemukan. ZRAM akan aktif setelah reboot.")
+
+    # Persist pakai zram-generator kalau ada
+    zr_gen = find_cmd("zram-generator") or ("/usr/lib/systemd/zram-generator"
+                                            if os.path.exists("/usr/lib/systemd/zram-generator") else None)
+    if zr_gen:
+        mib = int(bytes_ / 1024 / 1024)
+        pri = old_pri if old_pri is not None else 100
+        run(f"{SUDO} mkdir -p /etc/systemd/zram-generator.conf.d")
+        conf = f"[{os.path.basename(dev)}]\nzram-size = {mib}\npriorities = {pri}\n"
+        run(f"echo '{conf}' | {SUDO} tee /etc/systemd/zram-generator.conf.d/override.conf > /dev/null")
+        run(f"{SUDO} systemctl daemon-reexec")
+        print("✅ Persist zram-generator diperbarui.")
+    else:
+        print("ℹ zram-generator tidak ada; perubahan ZRAM hanya runtime.")
 
 
-# -------------------- NEW: Setup Hybrid (zram + swapfile) --------------------
+
+# -------------------- Setup Hybrid (zram + swapfile) --------------------
 def setup_hybrid():
-    print("\n=== Setup Hybrid (ZRAM + Swapfile) ===")
-    # Konfigurasi
-    zr_size = input("Ukuran ZRAM (contoh 2G, 4G, kosong=skip zram setup): ").strip()
-    sf_path = (input("Path swapfile (default: /swapfile): ").strip() or "/swapfile")
-    sf_size = input("Ukuran swapfile (contoh 8G): ").strip()
+    print("\n=== Setup Hybrid (ZRAM + Swapfile) — dengan pre-check anti double ===")
+
+    # Cek yang sudah aktif
+    existing = classify_existing_swaps()
+    has_zr = bool(existing['zram'])
+    has_sf = bool(existing['files'])
+
+    if has_zr or has_sf:
+        print("\nDitemukan swap aktif:")
+        if has_zr:
+            print(f"- ZRAM : {', '.join(existing['zram'])}")
+        if has_sf:
+            print(f"- Files: {', '.join(existing['files'])}")
+
+        print("\nApa yang ingin kamu lakukan?")
+        print("1) Buat baru (double) — tetap pertahankan yang lama")
+        print("2) Hapus yang lama, lalu buat baru")
+        print("3) Edit/Resize yang ada")
+        print("4) Batal")
+        choice = input("Pilih: ").strip()
+
+        if choice == "4":
+            return
+
+        # --- Opsi 3: Resize/edit langsung (sub-menu) ---
+        if choice == "3":
+            # Pilih resize apa
+            print("\nApa yang ingin di-resize?")
+            opts = []
+            if has_zr: opts.append("zram")
+            if has_sf: opts.append("swapfile")
+            for i, o in enumerate(opts, 1):
+                print(f"{i}) {o}")
+            print("0) Batal")
+            sel = input("Pilih: ").strip()
+            if sel == "0":
+                return
+            if not sel.isdigit() or not (1 <= int(sel) <= len(opts)):
+                print("❌ Pilihan tidak valid.")
+                return
+            target = opts[int(sel) - 1]
+
+            if target == "zram":
+                dev = pick_from_list("Pilih device ZRAM:", existing['zram'])
+                if dev:
+                    resize_zram(dev)
+            else:
+                path = pick_from_list("Pilih swapfile:", existing['files'])
+                if path:
+                    # Reuse fungsi resize swapfile
+                    def _resize_inline(p):
+                        nonlocal path
+                        path = p
+                        # Minta ukuran baru di sini supaya inline
+                        new_size = input(f"Ukuran baru untuk {path} (mis. 12G): ").strip()
+                        # Panggil resize_swapfile tapi override input
+                        # (duplikasi logic minimal dengan memanfaatkan fungsi yang ada)
+                        # == Begin mini-wrapper ==
+                        old_pri = get_priority_for(path)
+                        swapoff = find_cmd("swapoff")
+                        if swapoff:
+                            run(f"{SUDO} {swapoff} {path}")
+                        else:
+                            run(f"{SUDO} swapoff {path}")
+                        mib = parse_size_to_mib(new_size)
+                        if not mib:
+                            print("❌ Ukuran tidak valid.")
+                            return
+                        code, _, _ = run(f"{SUDO} fallocate -l {new_size} {path}")
+                        if code != 0:
+                            print("fallocate gagal, fallback ke dd ...")
+                            code, _, err = run(f"{SUDO} dd if=/dev/zero of={path} bs=1M count={mib} status=progress")
+                            if code != 0:
+                                print("❌ Gagal resize:", err)
+                                return
+                        run(f"{SUDO} chmod 600 {path}")
+                        run(f"{SUDO} mkswap {path}")
+                        swapon = find_cmd("swapon")
+                        if swapon:
+                            if old_pri is not None:
+                                code, _, err = run(f"{SUDO} {swapon} --priority {old_pri} {path}")
+                                if code != 0:
+                                    run(f"{SUDO} {swapon} -p {old_pri} {path}")
+                            else:
+                                run(f"{SUDO} {swapon} {path}")
+                            print("✅ Resize selesai & swapfile aktif kembali.")
+                        else:
+                            print("⚠ 'swapon' tidak ditemukan. Swap akan aktif setelah reboot.")
+                        run(f"{SUDO} sed -i '#{re.escape(path)}#d' /etc/fstab")
+                        opts = "defaults" + (f",pri={old_pri}" if old_pri is not None else "")
+                        run(f"echo '{path} none swap {opts} 0 0' | {SUDO} tee -a /etc/fstab > /dev/null")
+                        print("✅ /etc/fstab diperbarui.")
+                        # == End mini-wrapper ==
+
+                    _resize_inline(path)
+            return
+
+        # --- Opsi 2: Hapus yang lama dulu ---
+        if choice == "2":
+            # Hapus semua zram yang aktif
+            if has_zr:
+                swapoff = find_cmd("swapoff")
+                zramctl = find_cmd("zramctl")
+                for dev in existing['zram']:
+                    if swapoff: run(f"{SUDO} {swapoff} {dev}")
+                    else: run(f"{SUDO} swapoff {dev}")
+                    if zramctl:
+                        run(f"{SUDO} {zramctl} -r {dev}")
+                    else:
+                        # sysfs reset
+                        if os.path.exists(f"/sys/block/{os.path.basename(dev)}/reset"):
+                            run(f"echo 1 | {SUDO} tee /sys/block/{os.path.basename(dev)}/reset > /dev/null")
+            # Hapus semua swapfile
+            if has_sf:
+                for path in existing['files']:
+                    swapoff = find_cmd("swapoff")
+                    if swapoff: run(f"{SUDO} {swapoff} {path}")
+                    else: run(f"{SUDO} swapoff {path}")
+                    run(f"{SUDO} sed -i '#{re.escape(path)}#d' /etc/fstab")
+                    run(f"{SUDO} rm -f {path}")
+            print("✅ Swap/ZRAM lama dibersihkan. Lanjut buat hybrid baru...")
+
+        # --- Opsi 1: Buat baru (double) → cukup lanjut ke pembuatan baru di bawah ---
+        # (tidak menghapus yang lama)
+    else:
+        print("Tidak ada swap aktif. Membuat hybrid baru dari nol...")
+
+    # ====== Pembuatan hybrid baru (atau tambahan kalau pilih opsi 1) ======
+    zr_size = input("Ukuran ZRAM (mis. 2G, kosong=skip ZRAM): ").strip()
+    sf_path_default = "/swapfile2" if os.path.exists("/swapfile") else "/swapfile"
+    sf_path = (input(f"Path swapfile (default: {sf_path_default}): ").strip() or sf_path_default)
+    sf_size = input("Ukuran swapfile (mis. 8G): ").strip()
     pri_zr = input("Prioritas ZRAM (default 100): ").strip() or "100"
     pri_sf = input("Prioritas swapfile (default -1): ").strip() or "-1"
 
-    # 1) Setup/aktifkan ZRAM (runtime) jika user mengisi ukuran
+    # 1) ZRAM (opsional)
     if zr_size:
         bytes_ = parse_size_to_bytes(zr_size)
         if not bytes_:
             print("❌ Ukuran ZRAM tidak valid.")
             return
-        # pastikan modul zram
         run(f"{SUDO} modprobe zram")
-        # Pakai zramctl kalau ada (lebih portable), else sysfs manual
         zramctl = find_cmd("zramctl")
         target_dev = "/dev/zram0"
-        # Matikan kalau sudah aktif
-        swapoff = find_cmd("swapoff")
-        if swapoff:
-            run(f"{SUDO} {swapoff} {target_dev}")
-        # Allocate
         if zramctl:
-            # create/find zram0
-            run(f"{SUDO} {zramctl} --find --size {bytes_}")
-        else:
-            # Sysfs manual
-            if os.path.exists("/sys/block/zram0/disksize"):
-                run(f"echo {bytes_} | {SUDO} tee /sys/block/zram0/disksize > /dev/null")
-            else:
-                print("❌ Tidak menemukan /sys/block/zram0. ZRAM mungkin tidak tersedia pada kernel.")
+            # cari device free
+            code, out, err = run(f"{SUDO} {zramctl} --find --size {bytes_}")
+            if code != 0:
+                print("❌ Gagal alokasikan zram:", err)
                 return
-        # format & aktifkan dgn prioritas
+            target_dev = out.strip().splitlines()[-1] if out.strip() else target_dev
+        else:
+            # sysfs manual hanya aman untuk zram0
+            if not os.path.exists("/sys/block/zram0/disksize"):
+                print("❌ sysfs zram tidak ditemukan.")
+                return
+            run(f"echo {bytes_} | {SUDO} tee /sys/block/zram0/disksize > /dev/null")
         run(f"{SUDO} mkswap {target_dev}")
         swapon = find_cmd("swapon")
         if swapon:
             code, _, err = run(f"{SUDO} {swapon} --priority {pri_zr} {target_dev}")
             if code != 0:
                 run(f"{SUDO} {swapon} -p {pri_zr} {target_dev}")
-        print("✅ ZRAM aktif.")
+        print(f"✅ ZRAM aktif di {target_dev}.")
 
-        # Persist (best-effort) via zram-generator jika ada
-        zr_gen = find_cmd("zram-generator") or (
-            "/usr/lib/systemd/zram-generator" if os.path.exists("/usr/lib/systemd/zram-generator") else None
-        )
+        # Persist via zram-generator bila ada
+        zr_gen = find_cmd("zram-generator") or ("/usr/lib/systemd/zram-generator"
+                                                if os.path.exists("/usr/lib/systemd/zram-generator") else None)
         if zr_gen:
             run(f"{SUDO} mkdir -p /etc/systemd/zram-generator.conf.d")
-            conf = f"""
-[zram0]
-zram-size = {int(bytes_/1024/1024)}
-priorities = {pri_zr}
-"""
+            conf = f"[{os.path.basename(target_dev)}]\nzram-size = {int(bytes_/1024/1024)}\npriorities = {pri_zr}\n"
             run(f"echo '{conf}' | {SUDO} tee /etc/systemd/zram-generator.conf.d/override.conf > /dev/null")
             run(f"{SUDO} systemctl daemon-reexec")
-            print("✅ Konfigurasi zram-generator ditulis (persist).")
-        else:
-            print("ℹ zram-generator tidak ditemukan. Persist zram tidak dibuat (runtime only).")
+            print("✅ Persist zram-generator ditulis.")
 
-    # 2) Setup swapfile dengan prioritas lebih rendah
+    # 2) Swapfile wajib (hybrid)
     mib = parse_size_to_mib(sf_size)
     if not mib:
         print("❌ Ukuran swapfile tidak valid.")
         return
-
-    # Buat/format/aktifkan swapfile
     if not os.path.exists(sf_path):
         print(f"[Membuat swapfile] {sf_path} sebesar {sf_size} ...")
         code, _, _ = run(f"{SUDO} fallocate -l {sf_size} {sf_path}")
         if code != 0:
-            print("fallocate gagal, fallback ke dd ...")
+            print("fallocate gagal, fallback dd ...")
             code, _, err = run(f"{SUDO} dd if=/dev/zero of={sf_path} bs=1M count={mib} status=progress")
             if code != 0:
                 print("❌ Gagal membuat swapfile:", err)
@@ -354,20 +557,17 @@ priorities = {pri_zr}
     run(f"{SUDO} mkswap {sf_path}")
     swapon = find_cmd("swapon")
     if swapon:
-        # aktifkan dengan prioritas
         code, _, err = run(f"{SUDO} {swapon} --priority {pri_sf} {sf_path}")
         if code != 0:
             run(f"{SUDO} {swapon} -p {pri_sf} {sf_path}")
-        print("✅ Swapfile aktif (hybrid).")
+        print("✅ Swapfile aktif.")
     else:
         print("⚠ 'swapon' tidak ditemukan. Swapfile akan aktif setelah reboot.")
 
-    # Persist fstab untuk swapfile
-    run(f"{SUDO} sed -i '\#{re.escape(sf_path)}#d' /etc/fstab")
+    # Persist fstab
+    run(f"{SUDO} sed -i '#{re.escape(sf_path)}#d' /etc/fstab")
     run(f"echo '{sf_path} none swap defaults,pri={pri_sf} 0 0' | {SUDO} tee -a /etc/fstab > /dev/null")
-    print("✅ /etc/fstab diperbarui untuk swapfile (persist).")
-
-    print("\n✨ Hybrid selesai. ZRAM diprioritaskan lebih tinggi daripada swapfile (sesuai prioritas yang kamu set).")
+    print("✅ /etc/fstab diperbarui. Hybrid set!")
 
 
 # -------------------- Menu --------------------
