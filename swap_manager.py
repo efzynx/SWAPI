@@ -359,44 +359,53 @@ def resize_zram(dev="/dev/zram0", new_size_str=None):
         print("ℹ zram-generator tidak ada; perubahan ZRAM hanya runtime.")
 
 
-def create_zram_permanent(size_str, priority):
-    # Parsing input ukuran
-    size_str = size_str.strip().upper()
-    if size_str.endswith("G"):
-        bytes_size = int(size_str[:-1]) * 1024 * 1024 * 1024
-    elif size_str.endswith("M"):
-        bytes_size = int(size_str[:-1]) * 1024 * 1024
-    else:
-        bytes_size = int(size_str) * 1024 * 1024 * 1024  # default as GB
+def create_zram_permanent(size_gb, priority):
+    # Pastikan modul zram tersedia
+    subprocess.run(["modprobe", "zram"], check=False)
 
-    # Lanjut logika sebelumnya...
-    unit_size = bytes_size // 1024  # zramctl pakai KB
-    os.system(f"sudo zramctl --find --size {unit_size}K")
-    os.system(f"sudo mkswap /dev/zram0")
-    os.system(f"sudo swapon --priority {priority} /dev/zram0")
+    # Hilangkan suffix seperti G, M dari input size_gb jika ada
+    size_gb_clean = size_gb.strip().upper().replace("G", "").replace("M", "")
+    try:
+        size_gb_int = int(size_gb_clean)
+    except ValueError:
+        print(f"❌ Ukuran ZRAM '{size_gb}' tidak valid. Gunakan format seperti 1G atau 512M.")
+        return
 
-    # Buat config permanent
-    service_content = f"""[Unit]
-Description=Configure zram swap
+    # Hitung bytes
+    bytes_size = size_gb_int * 1024 * 1024 * 1024
+
+    # Cari device zram kosong
+    device = subprocess.getoutput("zramctl --find").strip()
+    if not device:
+        print("❌ Tidak ada device zram yang tersedia.")
+        return
+
+    # Set ukuran & aktifkan
+    subprocess.run(["zramctl", "--size", str(bytes_size), device], check=True)
+    subprocess.run(["mkswap", device], check=True)
+    subprocess.run(["swapon", "-p", str(priority), device], check=True)
+
+    # Buat systemd service permanen
+    zram_service = f"""[Unit]
+Description=ZRAM swap
+After=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=/sbin/modprobe zram
-ExecStart=/bin/bash -c "echo {unit_size} > /sys/block/zram0/disksize"
-ExecStart=/sbin/mkswap /dev/zram0
-ExecStart=/sbin/swapon --priority {priority} /dev/zram0
+ExecStart=/sbin/zramctl --size {bytes_size} {device}
+ExecStart=/sbin/mkswap {device}
+ExecStart=/sbin/swapon -p {priority} {device}
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 """
     with open("/etc/systemd/system/zram.service", "w") as f:
-        f.write(service_content)
+        f.write(zram_service)
+    subprocess.run(["systemctl", "enable", "zram.service"], check=False)
 
-    os.system("sudo systemctl daemon-reload")
-    os.system("sudo systemctl enable zram.service")
-    os.system("sudo systemctl start zram.service")
-
-    print(f"ZRAM permanent {size_str} dibuat dengan prioritas {priority}")
+    print(f"✅ ZRAM permanent {size_gb} dibuat dengan prioritas {priority}")
 
 
 
