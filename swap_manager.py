@@ -359,40 +359,45 @@ def resize_zram(dev="/dev/zram0", new_size_str=None):
         print("ℹ zram-generator tidak ada; perubahan ZRAM hanya runtime.")
 
 
-def create_zram_permanent(size_gb=2, priority=100):
-    service_path = "/etc/systemd/system/zram.service"
-    script_path = "/usr/local/bin/zram-start.sh"
+def create_zram_permanent(size_str, priority):
+    # Parsing input ukuran
+    size_str = size_str.strip().upper()
+    if size_str.endswith("G"):
+        bytes_size = int(size_str[:-1]) * 1024 * 1024 * 1024
+    elif size_str.endswith("M"):
+        bytes_size = int(size_str[:-1]) * 1024 * 1024
+    else:
+        bytes_size = int(size_str) * 1024 * 1024 * 1024  # default as GB
 
-    bytes_size = int(size_gb) * 1024 * 1024 * 1024
+    # Lanjut logika sebelumnya...
+    unit_size = bytes_size // 1024  # zramctl pakai KB
+    os.system(f"sudo zramctl --find --size {unit_size}K")
+    os.system(f"sudo mkswap /dev/zram0")
+    os.system(f"sudo swapon --priority {priority} /dev/zram0")
 
-    # tulis script via sudo tee (heredoc) supaya tidak error permission
-    script_content = f"""#!/bin/bash
-        modprobe zram
-        echo {bytes_size} > /sys/block/zram0/disksize
-        mkswap /dev/zram0
-        swapon -p {priority} /dev/zram0
-        """
-    run(f"{SUDO} tee {script_path} > /dev/null <<'EOF'\n{script_content}\nEOF")
-    run(f"{SUDO} chmod 755 {script_path}")
-
-    # tulis service unit via sudo tee (heredoc)
+    # Buat config permanent
     service_content = f"""[Unit]
-        Description=Enable ZRAM swap
-        After=multi-user.target
+Description=Configure zram swap
 
-        [Service]
-        Type=oneshot
-        ExecStart={script_path}
-        RemainAfterExit=true
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe zram
+ExecStart=/bin/bash -c "echo {unit_size} > /sys/block/zram0/disksize"
+ExecStart=/sbin/mkswap /dev/zram0
+ExecStart=/sbin/swapon --priority {priority} /dev/zram0
 
-        [Install]
-        WantedBy=multi-user.target
-        """
-    run(f"{SUDO} tee {service_path} > /dev/null <<'EOF'\n{service_content}\nEOF")
+[Install]
+WantedBy=multi-user.target
+"""
+    with open("/etc/systemd/system/zram.service", "w") as f:
+        f.write(service_content)
 
-    run(f"{SUDO} systemctl daemon-reload")
-    run(f"{SUDO} systemctl enable --now zram.service")
-    print(f"✅ ZRAM permanen {size_gb}GB dibuat dengan prioritas {priority}.")
+    os.system("sudo systemctl daemon-reload")
+    os.system("sudo systemctl enable zram.service")
+    os.system("sudo systemctl start zram.service")
+
+    print(f"ZRAM permanent {size_str} dibuat dengan prioritas {priority}")
+
 
 
 def remove_zram_permanent():
