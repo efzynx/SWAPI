@@ -586,8 +586,6 @@ def setup_hybrid():
 
             print("✅ Swap/ZRAM lama dibersihkan. Lanjut buat hybrid baru...")
 
-        # choice == "1" akan lanjut membuat hybrid tambahan (double)
-        # choice == "2" sudah membersihkan, lanjut membuat hybrid baru
 
     # Jika tidak ada swap atau user memilih buat baru / sudah dihapus, lanjut pembuatan hybrid
     print("\n== Konfigurasi Hybrid ==")
