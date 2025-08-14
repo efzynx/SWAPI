@@ -122,7 +122,7 @@ Pilih menu: 7
 
 ## 📜 Lisensi
 
-MIT License — Silakan gunakan, modifikasi, dan distribusikan dengan bebas.
+MGNU GPL-3.0 License.
 
 ---
 
