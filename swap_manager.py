@@ -612,6 +612,35 @@ def setup_hybrid():
     print("\n✨ Hybrid selesai. ZRAM (jika dibuat) dan swapfile sudah aktif dan persist sesuai konfigurasi.")
 
 
+# ----------------- Persentase penggunaan swap -------------------
+def set_swappiness(percent):
+    """Set vm.swappiness secara runtime dan permanent."""
+    try:
+        percent = int(percent)
+        if not (0 <= percent <= 100):
+            print("❌ Nilai swappiness harus antara 0 dan 100.")
+            return
+        run(f"{SUDO} sysctl -w vm.swappiness={percent} > /dev")
+        with open("/etc/sysctl.d/99-swap-tuning.conf", "w") as f:
+            f.write(f"vm.swappiness={percent}\n")
+        print(f"✅ Swap akan mulai digunakan setelah RAM terpakai ±{percent}% (vm.swappiness={percent})")
+    except ValueError:
+        print("❌ Masukkan angka valid.")
+
+def setup_swappiness_prompt():
+    """Prompt user untuk set swappiness."""
+    swap_percent = input("Gunakan swap setelah RAM terpakai berapa persen? (0-100, default=60): ").strip()
+    if not swap_percent:
+        swap_percent = "60"
+    set_swappiness(swap_percent)
+
+def menu_change_swappiness():
+    """Menu ubah swappiness."""
+    print("\n=== Ubah Persentase Penggunaan Swap ===")
+    swap_percent = input("Masukkan nilai baru (0-100): ").strip()
+    set_swappiness(swap_percent)
+
+
 
 # -------------------- Menu --------------------
 def main():
@@ -624,7 +653,8 @@ def main():
 4. Ubah prioritas swap
 5. Resize swapfile
 6. Setup hybrid otomatis (zram + swapfile)
-7. Keluar
+7. Ubah persentase penggunaan swap
+8. Keluar
 """)
         choice = input("Pilih menu: ").strip()
         if choice == "1":
@@ -640,6 +670,8 @@ def main():
         elif choice == "6":
             setup_hybrid()
         elif choice == "7":
+            setup_swappiness_prompt()
+        elif choice == "8":
             break
         else:
             print("❌ Pilihan tidak valid.")
